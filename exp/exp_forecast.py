@@ -92,6 +92,46 @@ class Exp_Forecast(Exp_Basic):
         self.model.train()
         return total_loss
 
+    def forward_batch(self, timeseries, forecast, input_mask):
+        timeseries = timeseries.to(self.device_name)
+        forecast = forecast.to(self.device_name)
+        input_mask = input_mask.to(self.device_name)
+
+        batch_size, n_channels, _ = timeseries.shape
+
+        scale_ts, scale_fc, observed_mask, scale_pred_mask = self._downsample(timeseries, forecast, input_mask)
+        n_patches = sum([_.shape[2] for _ in scale_ts])
+        input_embed = self.embed(scale_ts, scale_pred_mask)  # List of (bs, channel, patch, ps)
+
+        norm0 = self.scale_normalizers[0]
+        norm1 = self.scale_normalizers[1]
+
+        if self.linr:
+            for i in range(1 + self.num_new_scales):
+                if self.pred_mask_tokens:  # 只对context部分投影
+                    ctx_tokens = self._num_ctx_tokens_per_scale[i]
+                    input_embed[i][:, :, :ctx_tokens, :] = self.linear[i](input_embed[i][:, :, :ctx_tokens, :])
+                else:
+                    input_embed[i] = self.linear[i](input_embed[i])
+
+        # 拼接不同尺度
+        enc_in = torch.cat(input_embed, dim=2).reshape(batch_size * n_channels, n_patches, self.d_model)
+
+        # attention mask
+        patch_view_mask = Masking.convert_seq_to_patch_view(observed_mask, self.patch_size).to(self.device_name)
+        attention_mask = patch_view_mask.repeat_interleave(n_channels, dim=0)
+
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            output = self.model(inputs_embeds=enc_in, attention_mask=attention_mask)
+            enc_out = output.last_hidden_state.reshape(-1, n_channels, n_patches, self.d_model)
+            if self.pred_mask_tokens:
+                scale_repr = [enc_out[..., self._pred_index_of_a_given_scale(i), :] for i in range(1 + self.num_new_scales)]
+            else:
+                scale_repr = [enc_out[..., self._index_of_a_given_scale(i), :] for i in range(1 + self.num_new_scales)]
+            scale_head_out = [head(repr) for head, repr in zip(self.heads, scale_repr)]
+            scale_denorm_out = [self.scale_normalizers[i](x=scale_head_out[i], mode="denorm") for i in range(1 + self.num_new_scales)]
+
+        return scale_denorm_out, scale_fc
     def finetune(self, setting):
         finetune_data, finetune_loader = data_provider(self.args, flag='train')
         vali_data, vali_loader = data_provider(self.args, flag='val')
@@ -116,8 +156,8 @@ class Exp_Forecast(Exp_Basic):
         for epoch in range(self.args.finetune_epochs):
             iter_count = 0
 
-            loss_val = torch.tensor(0., device="cuda")
-            count = torch.tensor(0., device="cuda")
+            loss_val = torch.tensor(0., device = self.device)
+            count = torch.tensor(0., device = self.device)
 
             self.model.train()
             epoch_time = time.time()
